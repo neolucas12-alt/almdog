@@ -12,6 +12,7 @@ permissions:
 concurrency:
   group: almdog-check
   cancel-in-progress: false
+  # 겹치는 실행은 취소하지 않고 순서대로 대기시켜 push 충돌을 막는다
 
 jobs:
   check:
@@ -40,7 +41,18 @@ jobs:
           git add seen.json
           if git diff --staged --quiet; then
             echo "변경 없음"
-          else
-            git commit -m "chore: update seen.json [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "chore: update seen.json [skip ci]"
+          # 그 사이 원격이 앞서 있으면(수동 편집 등) 받아서 재시도
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "push 성공"
+              exit 0
+            fi
+            echo "push 실패, 재시도 $i/5"
+            git pull --rebase -X ours origin main
+            sleep $((i * 3))
+          done
+          echo "push 최종 실패"
+          exit 1
