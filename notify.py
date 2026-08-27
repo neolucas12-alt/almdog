@@ -1,6 +1,11 @@
 """
-알림dog - KSIA 반도체 교육과정 신규/모집오픈 알림
+알림dog - 다중 사이트 공지 알림
 GitHub Actions에서 주기적으로 실행되며, 변경사항을 Telegram으로 전송한다.
+
+사이트를 추가하려면:
+  1) parse_XXX(html, target) 함수를 하나 만든다
+  2) build_XXX(item, kind) 함수를 하나 만든다
+  3) TARGETS 리스트에 항목을 추가하며 parser/builder를 지정한다
 """
 import json
 import os
@@ -11,33 +16,6 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-
-BASE = "https://infra.ksia.or.kr"
-LIST_URL = BASE + "/user/Wo/WoUser0101.do"
-VIEW_URL = BASE + "/user/Wo/WoUser0101V.do"
-
-# 감시 대상. SCH_PRM_GB: 001=재직자, 002=예비취업자
-TARGETS = [
-    {
-        "name": "예비취업자 교육",
-        "params": {
-            "SCH_PRM_GB": "002",
-            "TAB_ID": "1",
-            "CURRENT_MENU_CODE": "MENU0040",
-            "TOP_MENU_CODE": "MENU0040",
-        },
-    },
-    # 재직자 교육도 받고 싶으면 아래 주석을 해제하세요.
-    # {
-    #     "name": "재직자 교육",
-    #     "params": {
-    #         "SCH_PRM_GB": "001",
-    #         "TAB_ID": "1",
-    #         "CURRENT_MENU_CODE": "MENU0039",
-    #         "TOP_MENU_CODE": "MENU0039",
-    #     },
-    # },
-]
 
 HEADERS = {
     "User-Agent": (
@@ -51,28 +29,22 @@ STATE_FILE = Path(__file__).parent / "seen.json"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-# 쉼표로 구분된 관심 키워드. 비워두면 전체 알림.
 KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "").split(",") if k.strip()]
 
 
-def fetch(params, retries=3):
-    """목록 페이지를 가져온다. 실패 시 지수 백오프로 재시도."""
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(LIST_URL, params=params, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding or "utf-8"
-            return r.text
-        except Exception as e:
-            last_err = e
-            if i < retries - 1:
-                time.sleep(2 ** i * 3)
-    raise RuntimeError(f"페이지 요청 실패: {last_err}")
+def esc(t):
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def parse(html, target):
-    """목록 HTML에서 과정 정보를 뽑아낸다."""
+# =========================================================
+# 사이트 1: KSIA 반도체 교육과정
+# =========================================================
+
+KSIA_LIST = "https://infra.ksia.or.kr/user/Wo/WoUser0101.do"
+KSIA_VIEW = "https://infra.ksia.or.kr/user/Wo/WoUser0101V.do"
+
+
+def parse_ksia(html, target):
     soup = BeautifulSoup(html, "lxml")
     items = []
     for li in soup.select("ul.programList > li"):
@@ -94,24 +66,134 @@ def parse(html, target):
         ]
         org_el = li.select_one(".p_name")
 
-        detail = f"{VIEW_URL}?" + "&".join(
+        detail = f"{KSIA_VIEW}?" + "&".join(
             f"{k}={v}" for k, v in {**target["params"], "WO_SEQ": seq}.items()
         )
 
-        items.append(
-            {
-                "seq": seq,
-                "category": target["name"],
-                "org": org_el.get_text(strip=True) if org_el else "",
-                "title": " ".join(a.get_text(strip=True).split()),
-                "apply_period": dates[0] if len(dates) > 0 else "",
-                "edu_period": dates[1] if len(dates) > 1 else "",
-                "capacity": chips[0] if len(chips) > 0 else "",
-                "state": chips[1] if len(chips) > 1 else "",
-                "url": detail,
-            }
-        )
+        items.append({
+            "uid": seq,
+            "category": target["name"],
+            "org": org_el.get_text(strip=True) if org_el else "",
+            "title": " ".join(a.get_text(strip=True).split()),
+            "apply_period": dates[0] if len(dates) > 0 else "",
+            "edu_period": dates[1] if len(dates) > 1 else "",
+            "capacity": chips[0] if len(chips) > 0 else "",
+            "state": chips[1] if len(chips) > 1 else "",
+            "url": detail,
+        })
     return items
+
+
+def build_ksia(item, kind):
+    head = "🆕 새 교육과정" if kind == "new" else "🔔 모집 시작"
+    return "\n".join([
+        f"<b>{head}</b>",
+        "",
+        f"<b>{esc(item['title'])}</b>",
+        f"🏫 {esc(item['org'])} · {esc(item['category'])}",
+        f"📅 모집 {esc(item['apply_period'])}",
+        f"📚 교육 {esc(item['edu_period'])}",
+        f"👥 {esc(item['capacity'])} · {esc(item['state'])}",
+        "",
+        f'<a href="{esc(item["url"])}">신청 페이지 열기</a>',
+    ])
+
+
+# =========================================================
+# 사이트 2: 연세대 전기전자공학부 채용 공지
+# =========================================================
+
+YONSEI_LIST = "https://ee.yonsei.ac.kr/ee/community/career_notice.do"
+
+
+def parse_yonsei(html, target):
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    for tr in soup.select("table.board-table tbody tr"):
+        a = tr.select_one("a.c-board-title")
+        if not a:
+            continue
+        m = re.search(r"articleNo=(\d+)", a.get("href", ""))
+        if not m:
+            continue
+        tds = tr.find_all("td", recursive=False)
+        items.append({
+            "uid": m.group(1),
+            "category": target["name"],
+            "org": tds[3].get_text(strip=True) if len(tds) > 3 else "",
+            "title": " ".join(a.get_text(strip=True).split()),
+            "date": tds[4].get_text(strip=True) if len(tds) > 4 else "",
+            "has_file": bool(tr.select_one(".board-notice-file")),
+            # 공지 게시판은 '상태' 개념이 없으므로 고정값을 둔다
+            "state": "-",
+            "url": f"{YONSEI_LIST}?mode=view&articleNo={m.group(1)}",
+        })
+    return items
+
+
+def build_yonsei(item, kind):
+    clip = " 📎 첨부파일 있음" if item.get("has_file") else ""
+    return "\n".join([
+        "<b>📢 새 채용 공지</b>",
+        "",
+        f"<b>{esc(item['title'])}</b>",
+        f"🏫 {esc(item['org'])} · {esc(item['category'])}",
+        f"🗓 {esc(item['date'])}{clip}",
+        "",
+        f'<a href="{esc(item["url"])}">공지 보러가기</a>',
+    ])
+
+
+# =========================================================
+# 감시 대상 등록
+# =========================================================
+
+TARGETS = [
+    {
+        "name": "예비취업자 교육",
+        "key": "ksia002",
+        "url": KSIA_LIST,
+        "params": {
+            "SCH_PRM_GB": "002",
+            "TAB_ID": "1",
+            "CURRENT_MENU_CODE": "MENU0040",
+            "TOP_MENU_CODE": "MENU0040",
+        },
+        "parser": parse_ksia,
+        "builder": build_ksia,
+        # 모집전 -> 모집중 전환도 알림
+        "watch_state": "모집중",
+    },
+    {
+        "name": "연세대 전기전자 채용",
+        "key": "yonsei-ee",
+        "url": YONSEI_LIST,
+        "params": {},
+        "parser": parse_yonsei,
+        "builder": build_yonsei,
+        # 공지 게시판은 상태 전환 개념이 없음
+        "watch_state": None,
+    },
+]
+
+
+# =========================================================
+# 공통 로직 (사이트가 늘어나도 바뀌지 않는 부분)
+# =========================================================
+
+def fetch(url, params, retries=3):
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params or None, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            r.encoding = r.apparent_encoding or "utf-8"
+            return r.text
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                time.sleep(2 ** i * 3)
+    raise RuntimeError(f"페이지 요청 실패: {last_err}")
 
 
 def load_state():
@@ -130,36 +212,15 @@ def save_state(state):
 
 
 def matches_keyword(item):
-    """키워드 미설정이면 전부 통과."""
     if not KEYWORDS:
         return True
-    haystack = f"{item['title']} {item['org']}"
+    haystack = f"{item.get('title','')} {item.get('org','')}"
     return any(k in haystack for k in KEYWORDS)
-
-
-def escape(t):
-    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def build_message(item, kind):
-    head = "🆕 새 교육과정" if kind == "new" else "🔔 모집 시작"
-    lines = [
-        f"<b>{head}</b>",
-        "",
-        f"<b>{escape(item['title'])}</b>",
-        f"🏫 {escape(item['org'])} · {escape(item['category'])}",
-        f"📅 모집 {escape(item['apply_period'])}",
-        f"📚 교육 {escape(item['edu_period'])}",
-        f"👥 {escape(item['capacity'])} · {escape(item['state'])}",
-        "",
-        f'<a href="{escape(item["url"])}">신청 페이지 열기</a>',
-    ]
-    return "\n".join(lines)
 
 
 def send(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print("[DRY RUN] 토큰 미설정, 콘솔 출력만 합니다.\n" + text + "\n" + "-" * 40)
+        print("[DRY RUN] 토큰 미설정, 콘솔 출력만 합니다.\n" + text + "\n" + "-" * 50)
         return True
     r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -180,38 +241,42 @@ def send(text):
 def main():
     state = load_state()
     first_run = len(state) == 0
-    current = {}
+    current = dict(state)  # 한 사이트가 실패해도 다른 사이트 기록은 보존
     notifications = []
 
     for target in TARGETS:
-        html = fetch(target["params"])
-        items = parse(html, target)
+        try:
+            html = fetch(target["url"], target["params"])
+            items = target["parser"](html, target)
+        except Exception as e:
+            print(f"경고: '{target['name']}' 확인 실패 — {e}", file=sys.stderr)
+            continue
+
         if not items:
-            # 파싱 0건은 사이트 구조 변경 신호일 수 있으므로 상태를 덮어쓰지 않는다.
-            print(f"경고: '{target['name']}' 파싱 결과 0건. 이번 회차는 건너뜁니다.", file=sys.stderr)
-            return 0
+            print(f"경고: '{target['name']}' 파싱 0건. 이 사이트는 건너뜁니다.", file=sys.stderr)
+            continue
+
         print(f"{target['name']}: {len(items)}건 수집")
 
         for item in items:
-            key = f"{target['params']['SCH_PRM_GB']}-{item['seq']}"
-            current[key] = {"state": item["state"], "title": item["title"]}
+            key = f"{target['key']}-{item['uid']}"
+            current[key] = {"state": item.get("state", "-"), "title": item["title"]}
             prev = state.get(key)
 
             if prev is None:
                 if not first_run and matches_keyword(item):
-                    notifications.append((item, "new"))
-            elif prev.get("state") != item["state"]:
-                # 모집전 -> 모집중 전환만 알린다. 마감 전환은 알리지 않는다.
-                if item["state"] == "모집중" and matches_keyword(item):
-                    notifications.append((item, "open"))
+                    notifications.append((item, target, "new"))
+            elif target["watch_state"] and prev.get("state") != item.get("state"):
+                if item.get("state") == target["watch_state"] and matches_keyword(item):
+                    notifications.append((item, target, "open"))
 
     if first_run:
         print(f"첫 실행: {len(current)}건을 기준선으로 저장합니다. 알림은 보내지 않습니다.")
     else:
         print(f"알림 대상 {len(notifications)}건")
-        for item, kind in notifications:
-            send(build_message(item, kind))
-            time.sleep(1)  # Telegram rate limit 여유
+        for item, target, kind in notifications:
+            send(target["builder"](item, kind))
+            time.sleep(1)
 
     save_state(current)
     return 0
